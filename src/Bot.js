@@ -42,9 +42,7 @@ class Bot {
             logger.info('Bot initialization completed');
 
             // Start monitoring last
-            logger.info('Starting monitoring service...');
             await this.monitorService.start();
-            logger.info('Monitoring service started successfully');
             
         } catch (error) {
             logger.error('Bot initialization failed:', error);
