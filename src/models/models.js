@@ -40,8 +40,25 @@ const StoryHistorySchema = new mongoose.Schema({
 // Compound index to efficiently find stories by username and timestamp
 StoryHistorySchema.index({ username: 1, storyTimestamp: -1 });
 
+const postHistorySchema = new mongoose.Schema({
+    username: { type: String, required: true, index: true },
+    postId: { type: String, required: true },
+    mediaUrl: { type: String, required: true },
+    mediaType: { type: String, enum: ['photo', 'video'], required: true },
+    caption: { type: String },
+    timestamp: { type: Date, required: true },
+    processedAt: { type: Date, required: true },
+    sentTo: [{ type: String }]
+}, { timestamps: true });
+
+// Compound index to efficiently find posts by username and postId
+postHistorySchema.index({ username: 1, postId: 1 }, { unique: true });
+
+const PostHistory = mongoose.model('PostHistory', postHistorySchema);
+
 module.exports = {
     MonitoredUser: mongoose.model('MonitoredUser', MonitoredUserSchema, 'monitored_users'),
     FollowerHistory: mongoose.model('FollowerHistory', FollowerHistorySchema, 'follower_history'),
-    StoryHistory: mongoose.model('StoryHistory', StoryHistorySchema, 'story_history')
+    StoryHistory: mongoose.model('StoryHistory', StoryHistorySchema, 'story_history'),
+    PostHistory
 };

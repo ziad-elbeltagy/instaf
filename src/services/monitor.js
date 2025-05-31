@@ -1,4 +1,4 @@
-const { MonitoredUser, FollowerHistory, StoryHistory } = require('../models/models');
+const { MonitoredUser, FollowerHistory, StoryHistory, PostHistory } = require('../models/models');
 const logger = require('../utils/logger');
 const config = require('../config/config');
 
@@ -11,11 +11,16 @@ class MonitorService {
         this.isReady = false; // New flag to track full initialization
         this.intervalId = null;
         this.storyIntervalId = null;
+        this.postIntervalId = null;
         this._recentlyAddedAccounts = {};
         this._lastStoryVideoUrl = new Map();
+        this._lastPostCheck = new Map(); // Track last post check time per user
+        this._requestQueue = []; // Queue for rate limiting
+        this._lastRequestTime = 0;
         this.options = {
-            requestDelay: config.API.REQUEST_DELAY_MS,
-            checkInterval: config.API.CHECK_INTERVAL_MS
+            requestDelay: 30000, // 30 seconds between requests (2 per minute)
+            checkInterval: config.API.CHECK_INTERVAL_MS,
+            postCheckInterval: 3600000 // 1 hour for post checks
         };
     }
 
@@ -72,11 +77,12 @@ class MonitorService {
             
             if (stillMonitored === 0) {
                 // Delete all history data for this user since no one is monitoring them anymore
-                const [followerResult, storyResult] = await Promise.all([
+                const [followerResult, storyResult, postResult] = await Promise.all([
                     FollowerHistory.deleteMany({ username }),
-                    StoryHistory.deleteMany({ username })
+                    StoryHistory.deleteMany({ username }),
+                    PostHistory.deleteMany({ username })
                 ]);
-                logger.info(`Deleted ${followerResult.deletedCount} follower records and ${storyResult.deletedCount} story records for @${username}`);
+                logger.info(`Deleted ${followerResult.deletedCount} follower records, ${storyResult.deletedCount} story records, and ${postResult.deletedCount} post records for @${username}`);
                 await this.bot.sendMessage(chatId, `✅ @${username} has been removed and all their data has been deleted.`);
             } else {
                 await this.bot.sendMessage(chatId, `✅ @${username} has been removed from this chat's monitoring list.`);
@@ -190,14 +196,131 @@ class MonitorService {
     }
 
     async checkSingleAccount(username, options = {}) {
-        const result = await this.instagramService.fetchProfileData(username);
+        const result = await this._rateLimitedRequest(() => 
+            this.instagramService.fetchProfileData(username)
+        );
+        
         if (!result.success) return null;
 
         const currentData = result.data;
         if (!currentData.apiResponseJson?.status) return null;
 
+        // Check if post count increased
+        const previousData = await FollowerHistory.findOne({ username }).sort({ createdAt: -1 });
+        if (previousData && currentData.postsCount > previousData.postsCount) {
+            // Post count increased, fetch new posts
+            await this._checkNewPosts(username);
+        }
+
         await this._processProfileData(username, currentData, options);
         return currentData;
+    }
+
+    async _checkNewPosts(username) {
+        try {
+            const lastCheck = this._lastPostCheck.get(username) || 0;
+            const now = Date.now();
+            
+            // Only check if it's been at least 5 minutes since last check
+            if (now - lastCheck < 300000) {
+                return;
+            }
+
+            this._lastPostCheck.set(username, now);
+            
+            const postResult = await this._rateLimitedRequest(() =>
+                this.instagramService.fetchAllPosts(username)
+            );
+
+            if (postResult.status === 'ok' && postResult.posts) {
+                await this._processPostResult(username, postResult.posts);
+            }
+        } catch (error) {
+            logger.error(`Error checking posts for @${username}:`, error);
+        }
+    }
+
+    async _processPostResult(username, posts) {
+        // Find the most recent post we've processed
+        const lastProcessedPost = await PostHistory.findOne({ username })
+            .sort({ processedAt: -1 })
+            .limit(1);
+
+        const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+        const newPosts = posts.filter(post => 
+            !lastProcessedPost || 
+            new Date(post.timestamp) > lastProcessedPost.processedAt
+        );
+
+        if (newPosts.length > 0) {
+            logger.info(`Found ${newPosts.length} new posts for @${username}`);
+            
+            for (const post of newPosts) {
+                const postRecord = new PostHistory({
+                    username,
+                    postId: post.id,
+                    mediaUrl: post.mediaUrl,
+                    mediaType: post.mediaType,
+                    caption: post.caption,
+                    timestamp: new Date(post.timestamp),
+                    processedAt: new Date(),
+                    sentTo: []
+                });
+                
+                await postRecord.save();
+                await this._notifyPost(username, post, postRecord);
+            }
+        }
+    }
+
+    async _notifyPost(username, post, postRecord) {
+        const subscribers = await MonitoredUser.find({ username }).select('chatId -_id');
+        const uniqueChatIds = [...new Set(subscribers.map(s => s.chatId))];
+        const instagramUrl = `https://instagram.com/${username}`;
+        
+        for (const chatId of uniqueChatIds) {
+            if (postRecord.sentTo.includes(chatId)) {
+                continue;
+            }
+
+            try {
+                const emoji = post.mediaType === 'video' ? '🎬' : '📸';
+                let sent = false;
+
+                if (post.mediaType === 'video') {
+                    await this.bot.sendVideo(chatId, post.mediaUrl, {
+                        caption: `${emoji} New Instagram post from [@${username}](${instagramUrl})\n\n${post.caption || ''}`,
+                        parse_mode: 'Markdown'
+                    }).then(() => sent = true).catch(async () => {
+                        await this.bot.sendMessage(chatId, 
+                            `${emoji} New Instagram post from [@${username}](${instagramUrl})\n\n${post.caption || ''}`,
+                            { parse_mode: 'Markdown' }
+                        );
+                        sent = true;
+                    });
+                } else if (post.mediaType === 'photo') {
+                    await this.bot.sendPhoto(chatId, post.mediaUrl, {
+                        caption: `${emoji} New Instagram post from [@${username}](${instagramUrl})\n\n${post.caption || ''}`,
+                        parse_mode: 'Markdown'
+                    }).then(() => sent = true).catch(async () => {
+                        await this.bot.sendMessage(chatId, 
+                            `${emoji} New Instagram post from [@${username}](${instagramUrl})\n\n${post.caption || ''}`,
+                            { parse_mode: 'Markdown' }
+                        );
+                        sent = true;
+                    });
+                }
+                
+                if (sent) {
+                    await PostHistory.updateOne(
+                        { _id: postRecord._id },
+                        { $addToSet: { sentTo: chatId } }
+                    );
+                }
+            } catch (error) {
+                logger.error(`Failed to notify chat ${chatId} about post from @${username}:`, error);
+            }
+        }
     }
 
     async _processProfileData(username, currentData, options) {
@@ -347,14 +470,11 @@ class MonitorService {
         try {
             logger.info('Starting monitoring service...');
             
-            // First check if we can retrieve accounts (tests database connection)
             await this._getUniqueMonitoredAccounts();
             
-            // Set ready state
             this.isInitializing = false;
             this.isRunning = true;
             
-            // Start monitoring loops
             logger.info('Starting initial account check...');
             await this.checkAllAccounts();
             
@@ -369,8 +489,8 @@ class MonitorService {
                     logger.error('Error in periodic account check:', err));
             }, this.options.checkInterval);
             
-            // Start story monitoring
             await this._startStoryMonitor();
+            await this._startPostMonitor();
             
             logger.info('Monitoring service started successfully.');
         } catch (error) {
@@ -389,6 +509,11 @@ class MonitorService {
         if (this.storyIntervalId) {
             clearInterval(this.storyIntervalId);
             this.storyIntervalId = null;
+        }
+
+        if (this.postIntervalId) {
+            clearInterval(this.postIntervalId);
+            this.postIntervalId = null;
         }
 
         this.isRunning = false;
@@ -554,6 +679,39 @@ class MonitorService {
                 logger.error(`Failed to notify chat ${chatId} about story from @${username}:`, error);
             }
         }
+    }
+
+    async _startPostMonitor() {
+        const checkPosts = async () => {
+            if (this.isInitializing) return;
+            
+            const usernames = await this._getUniqueMonitoredAccounts();
+            for (const username of usernames) {
+                try {
+                    await this._checkNewPosts(username);
+                    await this._delay(2000 + Math.floor(Math.random() * 1000));
+                } catch (error) {
+                    logger.error(`Error checking posts for @${username}:`, error);
+                }
+            }
+        };
+
+        await checkPosts();
+        this.postIntervalId = setInterval(checkPosts, this.options.postCheckInterval);
+        logger.info('Post monitor started (hourly checks)');
+    }
+
+    // Add rate limiting method
+    async _rateLimitedRequest(fn) {
+        const now = Date.now();
+        const timeSinceLastRequest = now - this._lastRequestTime;
+        
+        if (timeSinceLastRequest < this.options.requestDelay) {
+            await this._delay(this.options.requestDelay - timeSinceLastRequest);
+        }
+        
+        this._lastRequestTime = Date.now();
+        return fn();
     }
 }
 

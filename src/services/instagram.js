@@ -2,6 +2,7 @@ const axios = require('axios');
 const crypto = require('crypto');
 const logger = require('../utils/logger');
 const config = require('../config/config');
+const cheerio = require('cheerio');
 
 class InstagramService {
     constructor() {
@@ -137,42 +138,189 @@ class InstagramService {
     }
 
     _extractMediaUrl(html) {
-        const { JSDOM } = require('jsdom');
-        const dom = new JSDOM(html);
-        const doc = dom.window.document;
+        try {
+            const $ = cheerio.load(html);
+            
+            // Try video source first
+            const videoSource = $('video > source[type="video/mp4"]').attr('src');
+            if (videoSource) {
+                return { type: 'video', url: videoSource };
+            }
 
-        // Try video source first
-        const sourceElement = doc.querySelector('video > source[type="video/mp4"]');
-        if (sourceElement && sourceElement.src) {
-            return { type: 'video', url: sourceElement.src };
+            // Try download link for video
+            const downloadLink = $('a.btn.bg-gradient-success[href]').attr('href');
+            if (downloadLink && downloadLink.endsWith('.mp4')) {
+                return { type: 'video', url: downloadLink };
+            }
+
+            // Try generic MP4 links
+            const genericVideoLink = $('a[href$=".mp4"], video > source[src$=".mp4"]').attr('href') || 
+                                   $('video > source[src$=".mp4"]').attr('src');
+            if (genericVideoLink) {
+                return { type: 'video', url: genericVideoLink };
+            }
+
+            // Try image sources
+            const imgSource = $('img.story-image').attr('src');
+            if (imgSource) {
+                return { type: 'photo', url: imgSource };
+            }
+
+            // Try generic image links
+            const imageLink = $('a[href$=".jpg"], a[href$=".jpeg"], a[href$=".png"]').attr('href');
+            if (imageLink) {
+                return { type: 'photo', url: imageLink };
+            }
+
+            // If no media found
+            return { type: null, url: null };
+        } catch (error) {
+            logger.error('Error parsing media URL from HTML:', error);
+            return { type: null, url: null };
         }
+    }
 
-        // Try download link for video
-        const downloadLink = doc.querySelector('a.btn.bg-gradient-success[href]');
-        if (downloadLink && downloadLink.href && downloadLink.href.endsWith('.mp4')) {
-            return { type: 'video', url: downloadLink.href };
+    async fetchAllPosts(username) {
+        try {
+            const apiUrl = `${config.API.MOLLYGRAM_URL || 'https://content.mollygram.com'}`;
+            const response = await axios.get(apiUrl, {
+                params: {
+                    url: username,
+                    method: 'allposts'
+                },
+                timeout: 10000
+            });
+
+            if (response.data && response.data.status === 'ok' && response.data.html) {
+                // Parse the HTML response to extract posts
+                const posts = this._parsePostsFromHtml(response.data.html);
+                return {
+                    status: 'ok',
+                    posts: posts
+                };
+            }
+
+            return {
+                status: 'error',
+                message: 'Failed to fetch posts'
+            };
+        } catch (error) {
+            logger.error(`Error fetching posts for @${username}:`, error);
+            return {
+                status: 'error',
+                message: error.message
+            };
         }
+    }
 
-        // Try generic MP4 links
-        const genericVideoLink = doc.querySelector('a[href$=".mp4"], video > source[src$=".mp4"]');
-        if (genericVideoLink) {
-            return { type: 'video', url: genericVideoLink.href || genericVideoLink.src };
+    _parsePostsFromHtml(html) {
+        try {
+            const posts = [];
+            const $ = cheerio.load(html);
+            
+            // Find all post containers
+            $('div').each((i, element) => {
+                try {
+                    const $element = $(element);
+                    
+                    // Look for post indicators
+                    const hasLikes = $element.find('small').text().includes('K');
+                    const hasMedia = $element.find('a:contains("Download HD")').length > 0;
+                    
+                    if (hasLikes && hasMedia) {
+                        const mediaUrl = this._extractPostMediaUrl($element);
+                        if (mediaUrl) {
+                            const post = {
+                                id: this._generatePostId(mediaUrl),
+                                mediaUrl: mediaUrl,
+                                mediaType: this._determinePostMediaType($element),
+                                caption: this._extractPostCaption($element),
+                                timestamp: this._extractPostTimestamp($element)
+                            };
+                            posts.push(post);
+                        }
+                    }
+                } catch (error) {
+                    logger.error('Error parsing individual post:', error);
+                }
+            });
+            
+            return posts;
+        } catch (error) {
+            logger.error('Error parsing posts from HTML:', error);
+            return [];
         }
+    }
 
-        // Try image sources
-        const imgElement = doc.querySelector('img.story-image');
-        if (imgElement && imgElement.src) {
-            return { type: 'photo', url: imgElement.src };
+    _extractPostMediaUrl($element) {
+        const downloadLink = $element.find('a:contains("Download HD")').attr('href');
+        if (downloadLink) {
+            return downloadLink;
         }
-
-        // Try generic image links
-        const imageLink = doc.querySelector('a[href$=".jpg"], a[href$=".jpeg"], a[href$=".png"]');
-        if (imageLink && imageLink.href) {
-            return { type: 'photo', url: imageLink.href };
+        
+        // Try video source
+        const videoSource = $element.find('video > source').attr('src');
+        if (videoSource) {
+            return videoSource;
         }
+        
+        // Try image source
+        const imgSource = $element.find('img').attr('src');
+        if (imgSource) {
+            return imgSource;
+        }
+        
+        return null;
+    }
 
-        // If no media found
-        return { type: null, url: null };
+    _determinePostMediaType($element) {
+        if ($element.find('video').length > 0 || 
+            $element.find('source[type="video/mp4"]').length > 0 ||
+            $element.find('a[href$=".mp4"]').length > 0) {
+            return 'video';
+        }
+        return 'photo';
+    }
+
+    _extractPostCaption($element) {
+        const captionElement = $element.find('p');
+        return captionElement.text().trim() || null;
+    }
+
+    _extractPostTimestamp($element) {
+        const timeElement = $element.find('small:contains("ago")');
+        if (timeElement.length) {
+            const timeText = timeElement.text().trim();
+            return this._parseRelativeTime(timeText);
+        }
+        return new Date();
+    }
+
+    _generatePostId(mediaUrl) {
+        return crypto.createHash('md5').update(mediaUrl).digest('hex');
+    }
+
+    _parseRelativeTime(timeText) {
+        const now = new Date();
+        const match = timeText.match(/(\d+)\s*(day|week|month)s?\s*ago/i);
+        
+        if (match) {
+            const [_, amount, unit] = match;
+            const value = parseInt(amount);
+            
+            switch(unit.toLowerCase()) {
+                case 'day':
+                    return new Date(now - value * 24 * 60 * 60 * 1000);
+                case 'week':
+                    return new Date(now - value * 7 * 24 * 60 * 60 * 1000);
+                case 'month':
+                    return new Date(now - value * 30 * 24 * 60 * 60 * 1000);
+                default:
+                    return now;
+            }
+        }
+        
+        return now;
     }
 }
 
