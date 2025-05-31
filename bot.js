@@ -107,6 +107,9 @@ class InstagramFollowerBot {
     this.intervalId = null;
     this.isInitializing = true;
 
+    // In-memory map to track recently added accounts and suppress duplicate notifications
+    this._recentlyAddedAccounts = {}; // { username: timestamp }
+
     this.MonitoredUser = MonitoredUser;
     this.FollowerHistory = FollowerHistory;
 
@@ -248,7 +251,11 @@ Example: \`/add instagram\` or simply \`/stats\`
         await new this.MonitoredUser({ username, chatId, addedByUserId: userId }).save();
         this.logger.info(`User @${username} added for monitoring in chat ${chatId} by user ${userId}.`);
         this.bot.sendMessage(chatId, `✅ @${username} added to monitoring list. Performing an initial check...`);
-        await this.checkSingleAccount(username); // Perform initial check
+
+        // Set the recently added flag (timestamp in ms)
+        this._recentlyAddedAccounts[username] = Date.now();
+
+        await this.checkSingleAccount(username, { forceInitialNotification: true }); // Perform initial check, force notification
     });
 
     this._createAuthorizedHandler(/\/remove (.+)/, async (msg, match) => {
@@ -259,7 +266,15 @@ Example: \`/add instagram\` or simply \`/stats\`
         const result = await this.MonitoredUser.deleteOne({ username, chatId });
         if (result.deletedCount > 0) {
             this.logger.info(`User @${username} removed from monitoring in chat ${chatId}.`);
-            this.bot.sendMessage(chatId, `✅ @${username} has been removed from the monitoring list for this chat.`);
+            // Check if any other chats are still monitoring this username
+            const stillMonitored = await this.MonitoredUser.countDocuments({ username });
+            if (stillMonitored === 0) {
+                const delResult = await this.FollowerHistory.deleteMany({ username });
+                this.logger.info(`Deleted ${delResult.deletedCount} history records for @${username} (no chats monitoring).`);
+                this.bot.sendMessage(chatId, `✅ @${username} has been removed from the monitoring list for this chat and all their data has been deleted (no other chats monitoring).`);
+            } else {
+                this.bot.sendMessage(chatId, `✅ @${username} has been removed from the monitoring list for this chat. Data is kept because other chats are still monitoring this account.`);
+            }
         } else {
             this.bot.sendMessage(chatId, `⚠️ @${username} was not found in your monitoring list for this chat.`);
         }
@@ -570,7 +585,7 @@ Example: \`/add instagram\` or simply \`/stats\`
    * @param {string} username - The Instagram username to check.
    * @returns {Promise<object|null>} The current profile data or null on failure.
    */
-  async checkSingleAccount(username) {
+  async checkSingleAccount(username, options = {}) {
     this.logger.info(`Processing account: @${username}`);
     const result = await this.scrapeProfile(username); // Includes PFP hashing
 
@@ -592,6 +607,23 @@ Example: \`/add instagram\` or simply \`/stats\`
         username: currentData.username,
         // 'apiResponseJson.status': true // Optionally, only compare against previously *successful* fetches
     }).sort({ createdAt: -1 });
+
+    // Check if this account was just added (to suppress duplicate notification in periodic check)
+    let suppressInitialNotification = false;
+    if (options.forceInitialNotification) {
+      suppressInitialNotification = false;
+    } else if (this._recentlyAddedAccounts && this._recentlyAddedAccounts[username]) {
+      const now = Date.now();
+      const addedAt = this._recentlyAddedAccounts[username];
+      // Suppress notification if within 90 seconds of being added (adjust as needed)
+      if (now - addedAt < 90000) {
+        suppressInitialNotification = true;
+        this.logger.debug(`Suppressing duplicate notification for @${username} (added ${((now-addedAt)/1000).toFixed(1)}s ago)`);
+      } else {
+        // Clean up old flag
+        delete this._recentlyAddedAccounts[username];
+      }
+    }
 
     let hasChanged = false;
     // Initialize changesForNotification with all fields from currentData to ensure they are available
@@ -645,9 +677,11 @@ Example: \`/add instagram\` or simply \`/stats\`
         if (previousData) { // It's an update with changes
             this.logger.info(`Changes detected for @${currentData.username}. Preparing notification...`);
             await this._notifyChanges(currentData.username, changesForNotification);
-        } else { // It's the first successful record
+        } else if (!suppressInitialNotification) { // It's the first successful record, and not suppressed
             this.logger.info(`Initial data processed for @${currentData.username}. Preparing notification...`);
             await this._notifyNewAccount(currentData.username, currentData, result.timestamp, changesForNotification.profilePicChanged);
+        } else {
+            this.logger.info(`Initial notification for @${currentData.username} suppressed to avoid duplicate.`);
         }
     } else {
         this.logger.info(`No significant changes detected for @${currentData.username}.`);
@@ -732,21 +766,25 @@ Example: \`/add instagram\` or simply \`/stats\`
     message += `✅ *Verified:* ${data.isVerified ? 'Yes' : 'No'}\n`;
     message += `${data.isPrivate ? '🔒 Private Account' : '🌎 Public Account'}\n`;
     message += `\n🕒 ${new Date(recordTimestamp).toLocaleString()}`;
-    await this._broadcastToSubscribersTextOnly(message, username);
 
-    // Send initial profile picture if it exists
+    // If initial profile picture exists, send as photo with caption as the initial data
     if (initialProfilePicExists && data.userProfilePic) {
-        this.logger.info(`Sending initial profile picture for newly added @${username}.`);
+        this.logger.info(`Sending initial profile picture for newly added @${username} with initial data as caption.`);
         const subscribers = await this.MonitoredUser.find({ username }).select('chatId -_id');
         if (!subscribers || !subscribers.length) return;
         const uniqueChatIds = [...new Set(subscribers.map(s => s.chatId))];
         for (const chatId of uniqueChatIds) {
             try {
-                await this.bot.sendPhoto(chatId, data.userProfilePic, { caption: `🖼️ Initial profile picture for @${username}` });
+                await this.bot.sendPhoto(chatId, data.userProfilePic, { caption: message, parse_mode: 'Markdown' });
             } catch (e) {
                 this.logger.warn(`Could not send initial profile picture for @${username} to chat ${chatId}: ${e.message}`);
+                // Fallback: send as text if photo fails
+                try { await this.bot.sendMessage(chatId, message, { parse_mode: 'Markdown' }); } catch (ef) { this.logger.warn(`Could not send fallback text for @${username} to chat ${chatId}: ${ef.message}`); }
             }
         }
+    } else {
+        // No profile picture, just send as text
+        await this._broadcastToSubscribersTextOnly(message, username);
     }
   }
 
