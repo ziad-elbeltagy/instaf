@@ -26,5 +26,10 @@ COPY --from=dependencies /usr/src/app/node_modules ./node_modules
 # Copy the rest of your application code
 COPY . .
 
+# Expose the port the app runs on
+ARG PORT=3000
+ENV PORT=${PORT}
+EXPOSE ${PORT}
 
+# Start the application
 CMD [ "node", "index.js" ]
