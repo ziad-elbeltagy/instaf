@@ -32,15 +32,16 @@ const StoryHistorySchema = new mongoose.Schema({
     username: { type: String, required: true, lowercase: true, index: true },
     mediaUrl: { type: String, required: true },
     mediaType: { type: String, enum: ['photo', 'video'], required: true },
+    storyTimestamp: { type: Date, required: true, index: true }, // When the story was posted
     processedAt: { type: Date, default: Date.now },
     sentTo: [{ type: String }] // Array of chat IDs where this story was sent
 }, { timestamps: true });
 
-// Compound index to efficiently find stories by username and URL
-StoryHistorySchema.index({ username: 1, mediaUrl: 1 }, { unique: true });
+// Compound index to efficiently find stories by username and timestamp
+StoryHistorySchema.index({ username: 1, storyTimestamp: -1 });
 
 module.exports = {
-    MonitoredUser: mongoose.model('MonitoredUser', MonitoredUserSchema),
-    FollowerHistory: mongoose.model('FollowerHistory', FollowerHistorySchema),
-    StoryHistory: mongoose.model('StoryHistory', StoryHistorySchema)
+    MonitoredUser: mongoose.model('MonitoredUser', MonitoredUserSchema, 'monitored_users'),
+    FollowerHistory: mongoose.model('FollowerHistory', FollowerHistorySchema, 'follower_history'),
+    StoryHistory: mongoose.model('StoryHistory', StoryHistorySchema, 'story_history')
 };

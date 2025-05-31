@@ -42,10 +42,26 @@ class MonitorService {
 
         await new MonitoredUser({ username, chatId, addedByUserId: userId }).save();
         logger.info(`User @${username} added for monitoring in chat ${chatId} by user ${userId}.`);
-        await this.bot.sendMessage(chatId, `✅ @${username} added to monitoring list. Performing an initial check...`);
+        await this.bot.sendMessage(chatId, `✅ @${username} added to monitoring list. Performing initial checks...`);
 
-        this._recentlyAddedAccounts[username] = Date.now();
-        await this.checkSingleAccount(username, { forceInitialNotification: true });
+        // Perform initial profile and story checks
+        try {
+            // Check profile first
+            this._recentlyAddedAccounts[username] = Date.now();
+            await this.checkSingleAccount(username, { forceInitialNotification: true });
+
+            // Then check stories
+            const storyResult = await this.instagramService.fetchStoryData(username);
+            if (storyResult.status === 'ok' && storyResult.mediaUrl) {
+                await this.bot.sendMessage(chatId, `📸 Checking for active stories from @${username}...`);
+                await this._processStoryResult(username, storyResult);
+            } else if (storyResult.status === 'no_stories') {
+                await this.bot.sendMessage(chatId, `ℹ️ No active stories found for @${username}.`);
+            }
+        } catch (error) {
+            logger.error(`Error during initial checks for @${username}:`, error);
+            await this.bot.sendMessage(chatId, `⚠️ Added @${username} but encountered some issues during initial checks. Monitoring will continue normally.`);
+        }
     }
 
     async removeAccount(username, chatId) {
@@ -55,7 +71,12 @@ class MonitorService {
             const stillMonitored = await MonitoredUser.countDocuments({ username });
             
             if (stillMonitored === 0) {
-                const delResult = await FollowerHistory.deleteMany({ username });
+                // Delete all history data for this user since no one is monitoring them anymore
+                const [followerResult, storyResult] = await Promise.all([
+                    FollowerHistory.deleteMany({ username }),
+                    StoryHistory.deleteMany({ username })
+                ]);
+                logger.info(`Deleted ${followerResult.deletedCount} follower records and ${storyResult.deletedCount} story records for @${username}`);
                 await this.bot.sendMessage(chatId, `✅ @${username} has been removed and all their data has been deleted.`);
             } else {
                 await this.bot.sendMessage(chatId, `✅ @${username} has been removed from this chat's monitoring list.`);
@@ -145,8 +166,8 @@ class MonitorService {
     }
 
     _formatStatsMessage(latest, followerChange, historyLength) {
-        let message = `📊 *Statistics for @${latest.username}*\n\n`;
-        if (latest.userFullname) message += `👤 *Name:* ${latest.userFullname}\n`;
+        const instagramUrl = `https://instagram.com/${latest.username}`;
+        let message = `👤 *Name:* ${latest.userFullname || 'N/A'}\n`;
         message += `👥 *Followers:* ${latest.followersCount?.toLocaleString() || 'N/A'}\n`;
         message += `➡️ *Following:* ${latest.followingCount?.toLocaleString() || 'N/A'}\n`;
         message += `📝 *Posts:* ${latest.postsCount?.toLocaleString() || 'N/A'}\n`;
@@ -163,7 +184,8 @@ class MonitorService {
             message += `\n${changeIcon} *Change (last ${historyLength} checks):* ${followerChange > 0 ? '+' : ''}${followerChange.toLocaleString()} followers\n`;
         }
         
-        message += `\n🕒 *Last Checked:* ${new Date(latest.createdAt).toLocaleString()}`;
+        const now = new Date();
+        message += `\n🕒 *Last Checked:* ${now.toLocaleString()}\n\n[View Profile](${instagramUrl})`;
         return message;
     }
 
@@ -188,6 +210,94 @@ class MonitorService {
                 await this._notifyChanges(username, changes);
             } else if (!this._shouldSuppressNotification(username, options)) {
                 await this._notifyNewAccount(username, currentData);
+            }
+        }
+    }
+
+    async _notifyNewAccount(username, data) {
+        const subscribers = await MonitoredUser.find({ username }).select('chatId -_id');
+        const uniqueChatIds = [...new Set(subscribers.map(s => s.chatId))];
+        const instagramUrl = `https://instagram.com/${username}`;
+        
+        const message = this._formatStatsMessage(data, 0, 1);
+        
+        for (const chatId of uniqueChatIds) {
+            try {
+                if (data.userProfilePic) {
+                    await this.bot.sendPhoto(chatId, data.userProfilePic, {
+                        caption: `📊 *Initial data for* [@${username}](${instagramUrl})\n\n${message}`,
+                        parse_mode: 'Markdown'
+                    }).catch(async (error) => {
+                        logger.warn(`Failed to send profile picture for @${username}, falling back to text-only:`, error);
+                        await this.bot.sendMessage(chatId, 
+                            `📊 *Initial data for* [@${username}](${instagramUrl})\n\n${message}`, 
+                            { parse_mode: 'Markdown' }
+                        );
+                    });
+                } else {
+                    await this.bot.sendMessage(chatId, 
+                        `📊 *Initial data for* [@${username}](${instagramUrl})\n\n${message}`, 
+                        { parse_mode: 'Markdown' }
+                    );
+                }
+                logger.debug(`Initial data notification sent to chat ${chatId} for @${username}`);
+            } catch (error) {
+                logger.error(`Failed to send initial data to chat ${chatId} for @${username}:`, error);
+            }
+        }
+    }
+
+    async _notifyChanges(username, changes) {
+        const subscribers = await MonitoredUser.find({ username }).select('chatId -_id');
+        const uniqueChatIds = [...new Set(subscribers.map(s => s.chatId))];
+        const instagramUrl = `https://instagram.com/${username}`;
+        
+        let changeMessage = `🔄 *Changes detected for* [@${username}](${instagramUrl})\n\n`;
+        
+        if (changes.followerDiff !== 0) {
+            const emoji = changes.followerDiff > 0 ? '📈' : '📉';
+            changeMessage += `${emoji} *Followers:* ${changes.followerDiff > 0 ? '+' : ''}${changes.followerDiff.toLocaleString()}\n`;
+        }
+        
+        if (changes.followingDiff !== 0) {
+            const emoji = changes.followingDiff > 0 ? '📈' : '📉';
+            changeMessage += `${emoji} *Following:* ${changes.followingDiff > 0 ? '+' : ''}${changes.followingDiff.toLocaleString()}\n`;
+        }
+        
+        if (changes.postsDiff !== 0) {
+            const emoji = changes.postsDiff > 0 ? '📈' : '📉';
+            changeMessage += `${emoji} *Posts:* ${changes.postsDiff > 0 ? '+' : ''}${changes.postsDiff.toLocaleString()}\n`;
+        }
+        
+        if (changes.verifiedChanged) {
+            changeMessage += `✅ *Verified Status:* ${changes.current.isVerified ? 'Now Verified' : 'No Longer Verified'}\n`;
+        }
+        
+        if (changes.privateChanged) {
+            changeMessage += `${changes.current.isPrivate ? '🔒' : '🌎'} *Privacy:* ${changes.current.isPrivate ? 'Now Private' : 'Now Public'}\n`;
+        }
+        
+        if (changes.nameChanged) {
+            changeMessage += `👤 *Name:* ${changes.previous.userFullname || 'N/A'} → ${changes.current.userFullname || 'N/A'}\n`;
+        }
+        
+        if (changes.profilePicChanged) {
+            changeMessage += `🖼️ *Profile Picture:* Updated\n`;
+        }
+        
+        changeMessage += `\n📊 *Current Stats*\n`;
+        changeMessage += `👥 *Followers:* ${changes.current.followersCount?.toLocaleString() || 'N/A'}\n`;
+        changeMessage += `➡️ *Following:* ${changes.current.followingCount?.toLocaleString() || 'N/A'}\n`;
+        changeMessage += `📝 *Posts:* ${changes.current.postsCount?.toLocaleString() || 'N/A'}\n`;
+        
+        changeMessage += `\n🕒 *Detected at:* ${new Date().toLocaleString()}\n\n[View Profile](${instagramUrl})`;
+        
+        for (const chatId of uniqueChatIds) {
+            try {
+                await this.bot.sendMessage(chatId, changeMessage, { parse_mode: 'Markdown' });
+                logger.debug(`Change notification sent to chat ${chatId} for @${username}`);
+            } catch (error) {
+                logger.error(`Failed to send change notification to chat ${chatId} for @${username}:`, error);
             }
         }
     }
@@ -362,28 +472,34 @@ class MonitorService {
 
     async _processStoryResult(username, storyResult) {
         if (storyResult.status === 'ok' && storyResult.mediaUrl) {
-            // Check if we've already processed this story
-            const existingStory = await StoryHistory.findOne({
-                username,
-                mediaUrl: storyResult.mediaUrl
-            });
+            // Find the most recent story we've processed for this user
+            const lastProcessedStory = await StoryHistory.findOne({ username })
+                .sort({ processedAt: -1 })
+                .limit(1);
 
-            if (!existingStory) {
+            // If we have a last processed story, only process if this one is newer
+            // Add a 5-minute buffer to account for any time differences
+            const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+            const isNewStory = !lastProcessedStory || 
+                             (lastProcessedStory.processedAt < fiveMinutesAgo);
+
+            if (isNewStory) {
                 // New story, create record and notify
                 logger.info(`New story detected for @${username}`);
                 const storyRecord = new StoryHistory({
                     username,
                     mediaUrl: storyResult.mediaUrl,
                     mediaType: storyResult.mediaType,
+                    storyTimestamp: new Date(), // This is just for record keeping
+                    processedAt: new Date(),    // This is what we use for checking new stories
                     sentTo: [] // Will be populated as we send notifications
                 });
                 await storyRecord.save();
                 await this._notifyStory(username, storyResult.mediaUrl, storyResult.mediaType, storyRecord);
             } else {
-                logger.debug(`Story already processed for @${username}: ${storyResult.mediaUrl}`);
+                logger.debug(`Story already processed for @${username} (last processed at: ${lastProcessedStory.processedAt})`);
             }
         } else if (storyResult.status === 'no_stories') {
-            // Optional: You could clean up old stories here if needed
             logger.debug(`No active stories for @${username}`);
         }
     }
@@ -391,9 +507,9 @@ class MonitorService {
     async _notifyStory(username, mediaUrl, mediaType, storyRecord) {
         const subscribers = await MonitoredUser.find({ username }).select('chatId -_id');
         const uniqueChatIds = [...new Set(subscribers.map(s => s.chatId))];
+        const instagramUrl = `https://instagram.com/${username}`;
         
         for (const chatId of uniqueChatIds) {
-            // Skip if already sent to this chat
             if (storyRecord.sentTo.includes(chatId)) {
                 logger.debug(`Story already sent to chat ${chatId} for @${username}`);
                 continue;
@@ -405,24 +521,29 @@ class MonitorService {
 
                 if (mediaType === 'video') {
                     await this.bot.sendVideo(chatId, mediaUrl, {
-                        caption: `${emoji} New Instagram story from @${username}!`
+                        caption: `${emoji} New Instagram story from [@${username}](${instagramUrl})`,
+                        parse_mode: 'Markdown'
                     }).then(() => sent = true).catch(async () => {
                         await this.bot.sendMessage(chatId, 
-                            `${emoji} New Instagram story from @${username}: ${mediaUrl}`);
+                            `${emoji} New Instagram story from [@${username}](${instagramUrl})`,
+                            { parse_mode: 'Markdown' }
+                        );
                         sent = true;
                     });
                 } else if (mediaType === 'photo') {
                     await this.bot.sendPhoto(chatId, mediaUrl, {
-                        caption: `${emoji} New Instagram story from @${username}!`
+                        caption: `${emoji} New Instagram story from [@${username}](${instagramUrl})`,
+                        parse_mode: 'Markdown'
                     }).then(() => sent = true).catch(async () => {
                         await this.bot.sendMessage(chatId, 
-                            `${emoji} New Instagram story from @${username}: ${mediaUrl}`);
+                            `${emoji} New Instagram story from [@${username}](${instagramUrl})`,
+                            { parse_mode: 'Markdown' }
+                        );
                         sent = true;
                     });
                 }
-
+                
                 if (sent) {
-                    // Update the story record to mark this chat as notified
                     await StoryHistory.updateOne(
                         { _id: storyRecord._id },
                         { $addToSet: { sentTo: chatId } }

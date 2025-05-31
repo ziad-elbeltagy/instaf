@@ -25,6 +25,7 @@ process.on('uncaughtException', (error) => {
 async function main() {
     const app = express();
     let botInstance;
+    let isShuttingDown = false;  // Add shutdown flag
 
     try {
         botInstance = new Bot();
@@ -62,6 +63,11 @@ async function main() {
 
     // Graceful Shutdown Logic
     const gracefulShutdown = async (signal) => {
+        if (isShuttingDown) {
+            logger.info(`Received ${signal} but shutdown already in progress. Ignoring.`);
+            return;
+        }
+        isShuttingDown = true;
         logger.info(`Received ${signal}. Starting graceful shutdown...`);
 
         server.close(async (err) => {
