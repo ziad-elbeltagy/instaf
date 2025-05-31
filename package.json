@@ -1,12 +1,32 @@
 {
+  "name": "moegram",
+  "version": "1.0.0",
+  "description": "MoeGram is a Telegram automation and data extraction tool leveraging Puppeteer, Supabase, and MongoDB.",
+  "main": "bot.js",
+  "type": "module",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "nodemon bot.js",
+    "test": "echo \"No tests specified\" && exit 0"
+  },
+  "keywords": [
+    "telegram",
+    "automation",
+    "mongoose",
+    "bot",
+    "data-extraction"
+  ],
+  "license": "MIT",
   "dependencies": {
-    "@supabase/supabase-js": "^2.49.8",
     "axios": "^1.9.0",
     "dotenv": "^16.5.0",
     "mongoose": "^8.15.1",
-    "node-telegram-bot-api": "^0.66.0",
-    "puppeteer": "^24.9.0",
-    "puppeteer-extra": "^3.3.6",
-    "puppeteer-extra-plugin-stealth": "^2.11.2"
+    "node-telegram-bot-api": "^0.66.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
