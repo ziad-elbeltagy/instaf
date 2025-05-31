@@ -27,4 +27,4 @@ COPY --from=dependencies /usr/src/app/node_modules ./node_modules
 COPY . .
 
 
-CMD [ "node", "bot.js" ]
+CMD [ "node", "index.js" ]
